@@ -1,0 +1,20 @@
+# Test / build artifacts
+.pytest_cache/
+__pycache__/
+*.pyc
+node_modules/
+dist/
+build/
+*.crx
+*.zip
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local-only test outputs
+/tmp/jacf_*.json
+/tmp/perf_*.log
+/tmp/probe_*.json

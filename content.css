@@ -1,0 +1,139 @@
+/* ── Single-line filter bar above the LinkedIn job list ─────────────────── */
+#__jacf-filter-bar {
+  position: relative;             /* anchor the inline progress bar at bottom */
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;                /* if the pane is too narrow, gracefully wrap */
+  gap: 6px;
+  row-gap: 4px;
+  background: #f3f6fa;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 8px 10px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  font-size: 12px;
+  color: #1f2328;
+  overflow: visible;              /* no scrollbars — prefer wrapping */
+  box-sizing: border-box;
+}
+/* Slim progress bar at the bottom of OUR filter bar — the only loading-state
+   feedback. Fills 0% → 100% as cards finish; fades out when idle. */
+#__jacf-filter-bar::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 2px;
+  width: var(--jacf-progress, 0%);
+  background: #0a7d39;
+  opacity: 0;
+  transition: width 0.25s ease-out, opacity 0.4s ease-out;
+  pointer-events: none;
+}
+#__jacf-filter-bar.__jacf-loading::after { opacity: 0.9; }
+#__jacf-filter-bar.__jacf-hidden { display: none; }
+
+.__jacf-title {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: #57606a;
+  padding-right: 4px;
+  /* Hidden by default — colored swatches inside each bucket pill already
+     convey what the row is. Title showed up as wasted width on narrow panes. */
+  display: none;
+}
+.__jacf-checks {
+  display: inline-flex;
+  flex-wrap: wrap;                /* let individual pills wrap if very tight */
+  gap: 4px;
+}
+.__jacf-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border: 1.5px solid #d0d7de;
+  border-radius: 999px;
+  background: #fff;
+  cursor: pointer;
+  user-select: none;
+  line-height: 1.2;
+  transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+}
+.__jacf-check input {
+  /* Hide the native checkbox — the pill's filled background IS the
+     selection state. Saves ~13px of width per pill. */
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+  width: 0; height: 0;
+}
+.__jacf-swatch {
+  display: inline-block;
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+/* SELECTED state: whole pill fills with the bucket color, label flips white.
+   :has() is supported in Chrome 105+ — fine for our user. */
+.__jacf-check:has(input:checked) {
+  background: var(--c, #888);
+  border-color: var(--c, #888);
+  color: #fff;
+}
+.__jacf-check:has(input:checked) .__jacf-label {
+  color: #fff;
+  font-weight: 700;
+}
+.__jacf-check:has(input:checked) .__jacf-swatch {
+  background: #fff !important;
+}
+.__jacf-label { font-size: 12px; }
+/* Per-bucket count badges add ~25px each × 6 = 150px, which pushes the bar
+   beyond the LinkedIn list pane. Hide them — the bottom progress line +
+   the cards' own badges convey enough. */
+.__jacf-count { display: none; }
+
+.__jacf-progress {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: #57606a;
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;              /* push to right with collapse btn */
+}
+
+.__jacf-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #d0d7de;
+  background: #fff;
+  border-radius: 4px;
+  padding: 4px 6px;
+  color: #57606a;
+  cursor: pointer;
+  line-height: 1;
+}
+.__jacf-btn:hover { border-color: #57606a; color: #1f2328; }
+.__jacf-btn svg { display: block; }
+
+/* ── Bucket badge on each job card (top-right corner overlay) ───────────── */
+.__jacf-badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 10;
+  background: #666;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 4px;
+  pointer-events: none;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  letter-spacing: 0.2px;
+  transition: background-color 0.18s;
+}
+
