@@ -319,3 +319,48 @@ def test_8_active_buckets_persist_across_navigation(linkedin):
     assert checked, "100+ should remain checked after navigation (UI pref persistence)"
 
 
+# ── 9. Unsupported-layout fallback + recovery ──────────────────────────────
+def test_9_fallback_notice_on_unrecognized_layout(linkedin):
+    """Simulate LinkedIn's new SDUI layout by stripping the old-layout
+    selectors and injecting a new-layout signal. The extension should show a
+    fallback notice (instead of silently failing) and stop hammering. Then,
+    on navigating back to a real (recognized) layout, the notice should clear
+    and the bar should return."""
+    # Sabotage: continuously remove old-layout nodes + inject a new-layout
+    # signal so the content script sees "unrecognized + new-layout present".
+    linkedin.evaluate("""() => {
+      window.__jacfSab = setInterval(() => {
+        document.querySelectorAll(
+          '.scaffold-layout__list, .scaffold-layout__list-item, '
+          + '.jobs-search-results__list-item, li[data-occludable-job-id], [data-job-id]'
+        ).forEach(e => e.remove());
+        const bar = document.getElementById('__jacf-filter-bar');
+        if (bar) bar.remove();
+        if (!document.querySelector('div[componentkey="SearchResultsMainContent"]')) {
+          const d = document.createElement('div');
+          d.setAttribute('componentkey', 'SearchResultsMainContent');
+          document.body.appendChild(d);
+        }
+      }, 200);
+    }""")
+
+    # Wait past GIVE_UP_TICKS (~12s) + margin
+    linkedin.wait_for_timeout(15_000)
+    notice = linkedin.evaluate("() => !!document.getElementById('__jacf-notice')")
+    assert notice, "fallback notice should appear on an unrecognized layout"
+
+    state = linkedin.evaluate(GET_STATE_JS)
+    assert state.get("gaveUp") is True, "extension should be in give-up (slow heartbeat) mode"
+
+    # Recover: stop sabotage, navigate to a fresh recognized search.
+    linkedin.evaluate("() => clearInterval(window.__jacfSab)")
+    linkedin.goto(
+        "https://www.linkedin.com/jobs/search/?keywords=data%20engineer&geoId=103644278",
+        wait_until="domcontentloaded", timeout=30_000,
+    )
+    linkedin.wait_for_selector("#__jacf-filter-bar", timeout=15_000)
+    linkedin.wait_for_timeout(800)
+    notice_after = linkedin.evaluate("() => !!document.getElementById('__jacf-notice')")
+    assert not notice_after, "notice should clear once a recognized layout returns"
+
+

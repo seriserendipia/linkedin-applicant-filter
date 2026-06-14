@@ -1,65 +1,96 @@
 /**
  * Content script (ISOLATED world):
- *   - Polls the page for job cards (.scaffold-layout__list-item with [data-job-id]).
- *   - Sends new jobIds to background.js.
- *   - Receives parsed results back, paints a bucket badge on each card,
- *     and applies the user's filter (hide cards whose bucket isn't checked).
- *   - Injects a single-line filter bar above the list with: bucket toggles,
- *     a clear button, and a collapse button.
- *   - UI prefs (which buckets are checked + collapsed state) persist to
- *     chrome.storage.local so they survive page reloads and browser restarts.
+ *   - Polls the page for job cards, sends new jobIds to background.js.
+ *   - Receives parsed results, paints a bucket badge per card, applies filter.
+ *   - Injects a single-line filter bar above the list.
+ *   - UI prefs persist to chrome.storage.local.
  *
- * Polling instead of MutationObserver because LinkedIn's list churns
- * continuously (virtualization, observer debounce can starve). 1s ticks are
- * cheap thanks to the seen-set short-circuit.
+ * Resilience (added after LinkedIn shipped a new SDUI layout to some accounts):
+ *   - extAlive() guard: when the extension context is invalidated (e.g. after
+ *     a reload), every chrome.* call throws. We detect that and STOP all
+ *     polling so orphaned scripts don't spin forever.
+ *   - Layout detection + give-up: if we can't recognize the page layout after
+ *     GIVE_UP_TICKS, we show a one-time fallback notice and drop to a slow
+ *     heartbeat instead of hammering querySelectorAll every second.
+ *   - We never mutate LinkedIn's DOM on an unrecognized layout (no half-broken
+ *     badges); the user gets an honest "LinkedIn changed, update needed" note.
  */
 (function () {
   "use strict";
 
   const BADGE_CLASS = "__jacf-badge";
   const BAR_ID = "__jacf-filter-bar";
+  const NOTICE_ID = "__jacf-notice";
   const UI_PREFS_KEY = "__jacf_ui";
 
-  // Bucket UI labels (left-inclusive ranges). The 'unknown' bucket uses '?'
-  // to save horizontal space; full label is in title attribute.
+  const TICK_MS = 1000;          // normal poll cadence
+  const HEARTBEAT_MS = 8000;     // slow cadence after we give up on the layout
+  const GIVE_UP_TICKS = 12;      // ~12s of "layout unrecognized" before fallback
+
   const BUCKET_DEFS = [
-    { id: "0-10",    label: "0-10",   color: "#0a7d39" },  // green = low competition
+    { id: "0-10",    label: "0-10",   color: "#0a7d39" },
     { id: "10-30",   label: "10-30",  color: "#3a8a44" },
     { id: "30-50",   label: "30-50",  color: "#a47a18" },
     { id: "50-100",  label: "50-100", color: "#b8541c" },
-    { id: "100+",    label: "100+",   color: "#a52828" },  // red = high competition
+    { id: "100+",    label: "100+",   color: "#a52828" },
     { id: "unknown", label: "?",      color: "#666"    },
   ];
 
   // ── State ──────────────────────────────────────────────────────────────
-  const sentJobIds = new Set();             // jobIds we've already pushed to background
-  const results = new Map();                // jid → { bucket, count, kind, raw, error? }
-  let activeBuckets = new Set();            // empty → show all
-  let collapsed = false;                    // bar hidden when true
-  let prefsLoaded = false;                  // wait for storage before painting UI
+  const sentJobIds = new Set();
+  const results = new Map();
+  let activeBuckets = new Set();
+  let collapsed = false;
+  let prefsLoaded = false;
   let stopBannerShown = false;
   let lastSearchKey = "";
+  let unrecognizedTicks = 0;
+  let gaveUp = false;
+  let tickTimer = null;
+  let countsTimer = null;
+  let dead = false;
+
+  // ── Extension-context liveness ──────────────────────────────────────────
+  // After an extension reload/update, content scripts already injected into
+  // open tabs become "orphaned": chrome.runtime.id goes undefined and every
+  // chrome.* call throws. Detect and shut down cleanly.
+  function extAlive() {
+    try { return !!(chrome && chrome.runtime && chrome.runtime.id); }
+    catch { return false; }
+  }
+  function shutdown(reason) {
+    if (dead) return;
+    dead = true;
+    if (tickTimer) clearTimeout(tickTimer);
+    if (countsTimer) clearInterval(countsTimer);
+    // Best-effort: leave any rendered bar in place; just stop doing work.
+    // (No console spam — this is an expected lifecycle event.)
+  }
 
   // ── Persist UI prefs ───────────────────────────────────────────────────
   function loadPrefs() {
-    chrome.storage.local.get(UI_PREFS_KEY, (got) => {
-      const p = (got && got[UI_PREFS_KEY]) || {};
-      activeBuckets = new Set(Array.isArray(p.activeBuckets) ? p.activeBuckets : []);
-      collapsed = !!p.collapsed;
-      prefsLoaded = true;
-    });
+    if (!extAlive()) return;
+    try {
+      chrome.storage.local.get(UI_PREFS_KEY, (got) => {
+        if (chrome.runtime.lastError) return;
+        const p = (got && got[UI_PREFS_KEY]) || {};
+        activeBuckets = new Set(Array.isArray(p.activeBuckets) ? p.activeBuckets : []);
+        collapsed = !!p.collapsed;
+        prefsLoaded = true;
+      });
+    } catch { /* context died between check and call */ }
   }
   function savePrefs() {
-    chrome.storage.local.set({
-      [UI_PREFS_KEY]: {
-        activeBuckets: Array.from(activeBuckets),
-        collapsed,
-      },
-    });
+    if (!extAlive()) return;
+    try {
+      chrome.storage.local.set({
+        [UI_PREFS_KEY]: { activeBuckets: Array.from(activeBuckets), collapsed },
+      });
+    } catch { /* ignore */ }
   }
   loadPrefs();
 
-  // ── Bridge for tests: page world ↔ content script ──────────────────────
+  // ── Bridge for tests ────────────────────────────────────────────────────
   window.addEventListener("message", (ev) => {
     if (ev.source !== window) return;
     const msg = ev.data;
@@ -72,73 +103,115 @@
           resultsInMemory: Array.from(results.entries()),
           sentJobIds: Array.from(sentJobIds),
           activeBuckets: Array.from(activeBuckets),
-          collapsed,
-          prefsLoaded,
+          collapsed, prefsLoaded, gaveUp,
         },
       }, "*");
     }
   });
 
-  // Ember main-world shortcut: forward raw tertiary strings to the SW, which
-  // parses + caches them and pushes back via JACF_RESULT. For Promoted cards
-  // this skips the fetch queue entirely → instant badge.
+  // ── Ember main-world shortcut ──────────────────────────────────────────
   window.addEventListener("message", (ev) => {
     if (ev.source !== window) return;
     const msg = ev.data;
     if (!msg || msg.__jacf !== "ember_data") return;
-    // Only forward jids we haven't already resolved
+    if (!extAlive()) { shutdown("ember-orphan"); return; }
     const filtered = {};
     for (const [jid, t] of Object.entries(msg.data || {})) {
       if (results.has(jid)) continue;
       filtered[jid] = t;
     }
     if (Object.keys(filtered).length === 0) return;
-    chrome.runtime.sendMessage({ type: "JACF_EMBER_RESULT", data: filtered }, () => {
-      // ignore errors — content script has nothing to do on failure
-    });
+    try {
+      chrome.runtime.sendMessage({ type: "JACF_EMBER_RESULT", data: filtered }, () => {
+        void chrome.runtime.lastError;  // swallow
+      });
+    } catch { shutdown("ember-send"); }
   });
 
-  // ── Messages from background (results + toolbar toggle) ────────────────
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (!msg || !msg.type) return;
-    if (msg.type === "JACF_RESULT") {
-      results.set(msg.jid, msg.result);
-      paintBadgeForJob(msg.jid);
-      applyFilter();
-      if (msg.stopped && !stopBannerShown) {
-        showStopBanner(msg.stopReason || "stopped");
+  // ── Messages from background ───────────────────────────────────────────
+  try {
+    chrome.runtime.onMessage.addListener((msg) => {
+      if (!msg || !msg.type) return;
+      if (msg.type === "JACF_RESULT") {
+        results.set(msg.jid, msg.result);
+        paintBadgeForJob(msg.jid);
+        applyFilter();
+        if (msg.stopped && !stopBannerShown) showStopBanner(msg.stopReason || "stopped");
+      } else if (msg.type === "JACF_TOGGLE_BAR") {
+        collapsed = !collapsed;
+        savePrefs();
+        applyCollapsedState();
       }
-    } else if (msg.type === "JACF_TOGGLE_BAR") {
-      collapsed = !collapsed;
-      savePrefs();
-      applyCollapsedState();
+    });
+  } catch { /* context already dead */ }
+
+  // ── Main loop (self-scheduling so we can vary the cadence) ─────────────
+  function scheduleTick(delay) {
+    if (dead) return;
+    tickTimer = setTimeout(runTick, delay);
+  }
+  function runTick() {
+    if (dead) return;
+    if (!extAlive()) { shutdown("tick-orphan"); return; }
+    let nextDelay = TICK_MS;
+    try {
+      nextDelay = tick();
+    } catch (e) {
+      // Never let one bad tick kill the loop — but if it's a context error, stop.
+      if (!extAlive()) { shutdown("tick-throw"); return; }
     }
-  });
+    scheduleTick(nextDelay || TICK_MS);
+  }
+  scheduleTick(500);
 
-  // ── Main loop ──────────────────────────────────────────────────────────
-  setInterval(tick, 1000);
-  setTimeout(tick, 500);
-
+  // Returns the delay (ms) until the next tick.
   function tick() {
-    if (!/\/jobs\/(?:search|collections|search-results)/.test(location.pathname)) return;
-    if (!prefsLoaded) return;   // wait until we've restored persisted state
+    if (!/\/jobs\/(?:search|collections|search-results)/.test(location.pathname)) {
+      // Not on a job list page — clear any fallback notice, idle slowly.
+      removeNotice();
+      return HEARTBEAT_MS;
+    }
+    if (!prefsLoaded) return TICK_MS;
 
     const searchKey = location.pathname + location.search.replace(/&currentJobId=\d+/, "");
     if (searchKey !== lastSearchKey) {
       lastSearchKey = searchKey;
       sentJobIds.clear();
+      unrecognizedTicks = 0;
+      gaveUp = false;
+      removeNotice();
     }
 
-    ensureFilterBar();
+    const container = findListContainer();
+    const cards = container ? collectCards() : [];
+
+    // ── Layout recognition gate ──────────────────────────────────────────
+    if (!container || cards.length === 0) {
+      // Is there a *new-layout* signal on the page? If so and we still can't
+      // read it, this is the unsupported SDUI layout — give up gracefully.
+      const newLayoutSignal =
+        document.querySelector('div[componentkey="SearchResultsMainContent"]') ||
+        document.querySelector("div[data-sdui-screen]") ||
+        document.querySelector('a[href*="/jobs/view/"]');
+      unrecognizedTicks++;
+      if (newLayoutSignal && unrecognizedTicks >= GIVE_UP_TICKS && !gaveUp) {
+        gaveUp = true;
+        showFallbackNotice();
+        return HEARTBEAT_MS;       // stop hammering; recover if page changes
+      }
+      return gaveUp ? HEARTBEAT_MS : TICK_MS;
+    }
+
+    // We recognized the layout — clear any stale fallback + reset counter.
+    unrecognizedTicks = 0;
+    if (gaveUp) { gaveUp = false; removeNotice(); }
+
+    ensureFilterBar(container);
 
     const newIds = [];
-    for (const card of collectCards()) {
-      const jid = card.getAttribute("data-job-id")
-                || card.querySelector("[data-job-id]")?.getAttribute("data-job-id");
+    for (const card of cards) {
+      const jid = jobIdOf(card);
       if (!jid) continue;
-      // Only paint the final bucket badge on the card. Loading/pending
-      // feedback lives in our filter bar so we don't visually trespass
-      // on LinkedIn's UI.
       if (results.has(jid)) paintBadgeForJob(jid, card);
       if (sentJobIds.has(jid)) continue;
       sentJobIds.add(jid);
@@ -146,9 +219,8 @@
     }
 
     if (newIds.length > 0) {
-      chrome.runtime.sendMessage(
-        { type: "JACF_ENQUEUE", jobIds: newIds },
-        (resp) => {
+      try {
+        chrome.runtime.sendMessage({ type: "JACF_ENQUEUE", jobIds: newIds }, (resp) => {
           if (chrome.runtime.lastError || !resp) return;
           if (resp.cached) {
             for (const [jid, val] of Object.entries(resp.cached)) {
@@ -159,15 +231,24 @@
           }
           if (resp.stopped && !stopBannerShown) showStopBanner(resp.stopReason || "stopped");
           updateProgress(resp);
-        }
-      );
+        });
+      } catch { shutdown("enqueue-send"); return TICK_MS; }
     }
 
     applyFilter();
-    updateProgress(null);   // refresh ETA every tick from in-memory state
+    updateProgress(null);
+    return TICK_MS;
   }
 
-  // ── DOM helpers ────────────────────────────────────────────────────────
+  // ── Layout abstraction (old + new) ─────────────────────────────────────
+  // OLD layout: .scaffold-layout__list with .scaffold-layout__list-item cards.
+  // We only treat a layout as "recognized" when we can both find a container
+  // AND collect cards with extractable job IDs — otherwise we'd render a
+  // broken UI on a layout we can't actually read.
+  function findListContainer() {
+    return document.querySelector(".scaffold-layout__list") || null;
+  }
+
   function collectCards() {
     const selectors = [
       ".scaffold-layout__list-item",
@@ -186,6 +267,15 @@
     return out;
   }
 
+  function jobIdOf(card) {
+    return card.getAttribute("data-job-id")
+        || card.getAttribute("data-occludable-job-id")
+        || card.querySelector("[data-job-id]")?.getAttribute("data-job-id")
+        || (card.querySelector('a[href*="/jobs/view/"]')?.getAttribute("href")
+              ?.match(/\/jobs\/view\/(\d+)/)?.[1])
+        || null;
+  }
+
   function findCardForJobId(jid) {
     return (
       document.querySelector(`li[data-occludable-job-id="${jid}"]`) ||
@@ -194,6 +284,7 @@
     );
   }
 
+  // ── Badges ──────────────────────────────────────────────────────────────
   function getOrCreateBadge(card) {
     let badge = card.querySelector(`.${BADGE_CLASS}`);
     if (!badge) {
@@ -204,20 +295,17 @@
     }
     return badge;
   }
-
   function paintBadgeForJob(jid, card) {
     const res = results.get(jid);
     if (!res) return;
     card = card || findCardForJobId(jid);
     if (!card) return;
-
     const badge = getOrCreateBadge(card);
     const bucketId = res.bucket || "unknown";
     const def = BUCKET_DEFS.find((b) => b.id === bucketId) || BUCKET_DEFS[BUCKET_DEFS.length - 1];
     badge.style.background = def.color;
     badge.textContent = res.error ? "?" : def.label;
-    badge.title = res.error
-      ? `error: ${res.error}`
+    badge.title = res.error ? `error: ${res.error}`
       : (res.raw ? `LinkedIn says: "${res.raw}"` : "no count text found");
     card.setAttribute("data-jacf-bucket", bucketId);
   }
@@ -232,7 +320,7 @@
     }
     for (const card of collectCards()) {
       const bucket = card.getAttribute("data-jacf-bucket");
-      if (!bucket) continue;  // no bucket yet → leave alone (still loading)
+      if (!bucket) continue;
       const shouldShow = activeBuckets.has(bucket);
       if (shouldShow && card.hasAttribute("data-jacf-hidden")) {
         card.style.display = "";
@@ -245,15 +333,13 @@
   }
 
   // ── Filter bar UI ──────────────────────────────────────────────────────
-  function ensureFilterBar() {
+  function ensureFilterBar(container) {
     if (document.getElementById(BAR_ID)) return;
-    const list = document.querySelector(".scaffold-layout__list");
+    const list = container || findListContainer();
     if (!list) return;
 
     const bar = document.createElement("div");
     bar.id = BAR_ID;
-    // Inline SVG icons — keep them simple, monochrome currentColor so they
-    // pick up the button's text color.
     const ICON_CLEAR = `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <path d="M2 3h12l-4.5 5.2V13L6.5 11.5V8.2L2 3z"/><path d="M14 2L2 14"/>
     </svg>`;
@@ -271,8 +357,6 @@
     for (const def of BUCKET_DEFS) {
       const wrap = document.createElement("label");
       wrap.className = "__jacf-check";
-      // Per-pill --c lets CSS use the bucket color for the checked fill state
-      // (background swap + white label) without duplicating colors in CSS.
       wrap.style.setProperty("--c", def.color);
       wrap.innerHTML = `
         <input type="checkbox" data-bucket="${def.id}" ${activeBuckets.has(def.id) ? "checked" : ""}>
@@ -297,7 +381,10 @@
 
     list.insertBefore(bar, list.firstChild);
     applyCollapsedState();
-    setInterval(updateBucketCounts, 1000);
+    if (!countsTimer) countsTimer = setInterval(() => {
+      if (!extAlive()) { shutdown("counts-orphan"); return; }
+      updateBucketCounts();
+    }, 1000);
   }
 
   function clearAll() {
@@ -323,10 +410,7 @@
     }
   }
 
-  // Track last-known SW stats so we can update progress every tick, not just
-  // when we send an ENQUEUE.
   let lastSwStats = { activeWorkers: 3, queueSize: 0 };
-
   function updateProgress(resp) {
     if (resp) {
       lastSwStats = {
@@ -341,20 +425,13 @@
     const done = results.size;
     const remaining = Math.max(0, total - done);
     const workers = Math.max(1, lastSwStats.activeWorkers || 1);
-    // ETA = remaining * (avg jitter / workers). avg jitter ≈ 2.5s.
     const etaSec = Math.round((remaining * 2.5) / workers);
     if (remaining > 0) {
       el.textContent = `已标 ${done}/${total} · 约 ${etaSec}s`;
       el.style.display = "";
     } else {
-      // When idle, hide the progress text entirely so the bar stays tight.
-      // The slim bottom progress line already signals "done" by fading out.
       el.style.display = "none";
     }
-    // Drive the slim progress bar at the bottom of OUR filter bar — the only
-    // place we paint loading feedback. Clamp to 100% (results.size can briefly
-    // exceed sentJobIds.size when the Ember shortcut hands back jids we
-    // haven't yet seen in the visible card scan).
     const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
     bar.style.setProperty("--jacf-progress", pct + "%");
     bar.classList.toggle("__jacf-loading", remaining > 0);
@@ -372,5 +449,22 @@
     el.textContent = labels[reason] || `停: ${reason}`;
     el.style.color = "#c33";
     el.style.fontWeight = "600";
+  }
+
+  // ── Fallback notice for unsupported (new SDUI) layout ───────────────────
+  function showFallbackNotice() {
+    if (document.getElementById(NOTICE_ID)) return;
+    const n = document.createElement("div");
+    n.id = NOTICE_ID;
+    n.innerHTML = `
+      <span class="__jacf-notice-text">领英更新了职位页面布局,本扩展暂时无法在此页面读取申请人数,正在适配中。</span>
+      <button class="__jacf-notice-close" type="button" aria-label="关闭">×</button>
+    `;
+    n.querySelector(".__jacf-notice-close").addEventListener("click", () => n.remove());
+    document.body.appendChild(n);
+  }
+  function removeNotice() {
+    const n = document.getElementById(NOTICE_ID);
+    if (n) n.remove();
   }
 })();

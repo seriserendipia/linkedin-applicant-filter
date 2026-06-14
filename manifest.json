@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LinkedIn Applicant Filter",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Auto-fetches per-job applicant counts on LinkedIn search and lets you bucket-filter low-competition jobs.",
   "permissions": [
     "storage"
