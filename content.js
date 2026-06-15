@@ -240,13 +240,18 @@
     return TICK_MS;
   }
 
-  // ── Layout abstraction (old + new) ─────────────────────────────────────
-  // OLD layout: .scaffold-layout__list with .scaffold-layout__list-item cards.
-  // We only treat a layout as "recognized" when we can both find a container
-  // AND collect cards with extractable job IDs — otherwise we'd render a
-  // broken UI on a layout we can't actually read.
+  // ── Layout abstraction (old + new SDUI) ────────────────────────────────
+  // OLD board: .scaffold-layout__list with .scaffold-layout__list-item cards
+  //   (data-job-id present).
+  // NEW AI/SDUI search: no scaffold list, no data-job-id. main_world.js stamps
+  //   each card with data-jacf-jid="{id}" (extracted from React fiber). The
+  //   container is div[componentkey="SearchResultsMainContent"].
+  // We only treat a layout as "recognized" when we can find a container AND
+  // collect cards with extractable job IDs.
   function findListContainer() {
-    return document.querySelector(".scaffold-layout__list") || null;
+    return document.querySelector(".scaffold-layout__list")
+        || document.querySelector('div[componentkey="SearchResultsMainContent"]')
+        || null;
   }
 
   function collectCards() {
@@ -254,6 +259,7 @@
       ".scaffold-layout__list-item",
       ".jobs-search-results__list-item",
       "li[data-occludable-job-id]",
+      "[data-jacf-jid]",                  // new SDUI: stamped by main_world.js
     ];
     const seen = new Set();
     const out = [];
@@ -268,7 +274,8 @@
   }
 
   function jobIdOf(card) {
-    return card.getAttribute("data-job-id")
+    return card.getAttribute("data-jacf-jid")
+        || card.getAttribute("data-job-id")
         || card.getAttribute("data-occludable-job-id")
         || card.querySelector("[data-job-id]")?.getAttribute("data-job-id")
         || (card.querySelector('a[href*="/jobs/view/"]')?.getAttribute("href")
@@ -278,6 +285,7 @@
 
   function findCardForJobId(jid) {
     return (
+      document.querySelector(`[data-jacf-jid="${jid}"]`) ||
       document.querySelector(`li[data-occludable-job-id="${jid}"]`) ||
       document.querySelector(`[data-job-id="${jid}"]`)?.closest("li, .scaffold-layout__list-item") ||
       document.querySelector(`[data-job-id="${jid}"]`)
@@ -379,7 +387,16 @@
       applyCollapsedState();
     });
 
-    list.insertBefore(bar, list.firstChild);
+    // Old scaffold list: insert the bar inside, above the <ul>. SDUI container:
+    // insert before it (as a previous sibling) so we don't disturb its
+    // internal scroll/virtualization.
+    if (list.classList.contains("scaffold-layout__list")) {
+      list.insertBefore(bar, list.firstChild);
+    } else if (list.parentElement) {
+      list.parentElement.insertBefore(bar, list);
+    } else {
+      list.insertBefore(bar, list.firstChild);
+    }
     applyCollapsedState();
     if (!countsTimer) countsTimer = setInterval(() => {
       if (!extAlive()) { shutdown("counts-orphan"); return; }

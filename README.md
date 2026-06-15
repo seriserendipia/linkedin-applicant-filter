@@ -134,6 +134,27 @@ The two paths feed the same `chrome.storage.session` cache, keyed by jobId,
 and emit the same `JACF_RESULT` message to the content script. From the
 content script's perspective, results just arrive.
 
+**Two LinkedIn layouts.** LinkedIn A/B-tests two job-search surfaces:
+
+- **Classic board** (`/jobs/search/`) — `.scaffold-layout__list` with
+  `[data-job-id]` cards. The content script reads job IDs straight from the
+  DOM.
+- **AI / SDUI semantic search** (`/jobs/search-results/?origin=SEMANTIC_…`) —
+  a React server-driven UI with **no Ember store, no `data-job-id`, no
+  `/jobs/view/` links, and obfuscated hashed class names**. The only place
+  each card's job ID lives is its **React fiber props**
+  (`JobCardFrameworkImplDismissedState_{id}`). Since fiber props are
+  page-set expandos invisible to an isolated-world content script, the
+  MAIN-world `main_world.js` reads them and **stamps each card element with
+  `data-jacf-jid="{id}"`** — a real DOM attribute, shared across worlds. The
+  isolated content script then treats `[data-jacf-jid]` elements as cards and
+  reuses every downstream path (fetch, badge, filter). To get the right card
+  box (not a leaf node), it climbs from the id-bearing anchor up to the
+  largest ancestor that doesn't merge another card's anchor.
+
+  If we land on a surface we can't read at all, a dismissible fallback notice
+  tells the user instead of failing silently (see Resilience).
+
 **Why polling and not MutationObserver?** LinkedIn's list virtualizes
 aggressively — observer callbacks frequently fire before the new card has
 its `data-job-id` attribute set, and the observer can starve on rapid
