@@ -6,6 +6,14 @@
 
 ![Filter bar in action](docs/screenshots/main.png)
 
+> [!IMPORTANT]
+> **Not affiliated with, endorsed by, or sponsored by LinkedIn.** This is an
+> independent, non-commercial, personal-use project. It operates on pages your
+> own logged-in browser loads. Automated access may conflict with LinkedIn's
+> [User Agreement](https://www.linkedin.com/legal/user-agreement) (§8.2) and
+> could put your account at risk. **Use at your own risk.** See
+> [Known limits & honesty notes](#known-limits--honesty-notes).
+
 ---
 
 ## Table of contents
